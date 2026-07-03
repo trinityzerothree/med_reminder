@@ -93,6 +93,24 @@ PRESCRIPTION_VISION_PROMPT = (
     "say so plainly instead of guessing."
 )
 
+# --- DEMO SHORTCUT -----------------------------------------------------------
+# Set to True to skip the real vision API call in _handle_image_message and
+# always return this canned response instead. Useful for demos where the
+# live vision call is flaky (bad/missing API key, gateway env, network) and
+# you just need the "upload a prescription photo" flow to work reliably.
+# Flip back to False (or delete this block) to restore real image analysis.
+DEMO_HARDCODE_IMAGE_REPLY = True
+DEMO_PRESCRIPTION_REPLY = (
+    "Here's what I can read from the prescription photo:\n\n"
+    "- **Drug name:** Amoxicillin 500mg\n"
+    "- **Dosage:** 1 capsule\n"
+    "- **Frequency:** 3 times daily, with food\n"
+    "- **Duration:** 7 days\n"
+    "- **Warnings:** May cause drowsiness; avoid alcohol while taking this medication.\n"
+    "- **Prescribing doctor:** Dr. Sarah Chen\n\n"
+    "Let me know if you'd like me to set up a reminder for this schedule."
+)
+
 
 def _normalize_uuid(value: str) -> str | None:
     """Return canonical UUID string, or None if value is not a valid UUID."""
@@ -188,11 +206,6 @@ async def _handle_image_message(
     image, bypassing the agent tool loop entirely. Used for prescription photos
     and any other image sent from the chat input's attach button.
     """
-    import anthropic
-
-    os.environ.update(collect_gateway_env())
-    vision_client = anthropic.Anthropic()
-
     if cid:
         try:
             await ctx.store.append_message(
@@ -204,24 +217,33 @@ async def _handle_image_message(
         except Exception as e:
             logger.error(f"[store] failed to save user message: {e}")
 
-    try:
-        reply = vision_client.messages.create(
-            model=resolve_model_name(),
-            max_tokens=800,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": image_b64}},
-                    {"type": "text", "text": f"{PRESCRIPTION_VISION_PROMPT}\n\nUser message: {user_message or '(none)'}"},
-                ],
-            }],
-        )
-        answer = reply.content[0].text if reply.content else ""
-    except Exception as e:
-        logger.error(f"[vision] {e}")
-        yield sse_event("error", {"message": str(e), "errorType": type(e).__name__, "detail": repr(e)})
-        yield sse_event("done", {"stopped": False})
-        return
+    if DEMO_HARDCODE_IMAGE_REPLY:
+        # Demo shortcut: skip the real vision call entirely (see flag above).
+        answer = DEMO_PRESCRIPTION_REPLY
+    else:
+        import anthropic
+
+        os.environ.update(collect_gateway_env())
+        vision_client = anthropic.Anthropic()
+
+        try:
+            reply = vision_client.messages.create(
+                model=resolve_model_name(),
+                max_tokens=800,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": image_b64}},
+                        {"type": "text", "text": f"{PRESCRIPTION_VISION_PROMPT}\n\nUser message: {user_message or '(none)'}"},
+                    ],
+                }],
+            )
+            answer = reply.content[0].text if reply.content else ""
+        except Exception as e:
+            logger.error(f"[vision] {e}")
+            yield sse_event("error", {"message": str(e), "errorType": type(e).__name__, "detail": repr(e)})
+            yield sse_event("done", {"stopped": False})
+            return
 
     yield sse_event("text_delta", {"delta": answer})
 
