@@ -41,6 +41,11 @@ export interface SkillLoadedPayload {
   status: 'loaded';
 }
 
+export interface ImageInput {
+  base64: string;
+  mimeType: string;
+}
+
 export interface StreamCallbacks {
   onTextDelta: (delta: string) => void;
   onToolCalled: (toolName: string) => void;
@@ -86,6 +91,9 @@ export async function fetchConversationHistory(conversationId: string, userId?: 
  * Stream POST /chat over SSE.
  * Backend events: text_delta / tool_called / image / skills_loaded / skills_available / skill_loaded / ping / done / error.
  *
+ * Optional `image` attaches a base64-encoded photo to the request (e.g. a prescription
+ * photo). The backend chat handler branches to a vision call when this field is present.
+ *
  * Returns an AbortController the caller can use to abort the request (or pair with /stop for a graceful stop).
  */
 export function sendMessageStream(
@@ -94,6 +102,7 @@ export function sendMessageStream(
   conversationId?: string,
   messageIds?: { userMsgId: string; botMsgId: string },
   userId?: string,
+  image?: ImageInput,
 ): AbortController {
   const ctrl = new AbortController();
 
@@ -114,6 +123,8 @@ export function sendMessageStream(
           userMsgId: messageIds?.userMsgId,
           botMsgId: messageIds?.botMsgId,
           userId,
+          image: image?.base64,
+          mimeType: image?.mimeType,
         }),
         signal: ctrl.signal,
       });
@@ -248,18 +259,6 @@ function dispatchSseChunk(part: string, cb: StreamCallbacks, markDone: () => voi
  */
 export async function stopAgent(conversationId?: string): Promise<boolean> {
   try {
-    /**
-     * EdgeOne agents/ runtime requires Markers-Conversation-Id on every
-     * agents/* request (since 2026-06-05 platform upgrade) — without it
-     * the runtime returns 400 (`AGENT_CONVERSATION_ID_REQUIRED`) before
-     * the handler runs.
-     *
-     * Earlier comments in this codebase warned that adding the header on
-     * /stop would overwrite chat's abort signal slot. The new runtime is
-     * expected to no longer have that bug; if you observe stop succeeding
-     * but chat not actually aborting, revisit this and use a different
-     * cancellation channel.
-     */
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
     };
