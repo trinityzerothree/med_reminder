@@ -1,14 +1,16 @@
 """
-Prescription scanner handler — EdgeOne Makers.
+Prescription scanner handler - EdgeOne Makers.
 Route: POST /scanner
 Accepts: { "image": "<base64>", "mimeType": "image/jpeg" }
 Returns: JSON with extracted prescription fields
 """
 
+import os
 import json
 import anthropic
-from .._model import resolve_model_name
+from .._model import collect_gateway_env, resolve_model_name
 
+os.environ.update(collect_gateway_env())
 client = anthropic.Anthropic()
 
 EXTRACTION_PROMPT = """Extract the following from this prescription image and return ONLY valid JSON, no other text:
@@ -20,6 +22,7 @@ EXTRACTION_PROMPT = """Extract the following from this prescription image and re
   "prescribing_doctor": null
 }
 If a field is unreadable, keep it null."""
+
 
 async def handler(ctx):
     body = ctx.request.body
