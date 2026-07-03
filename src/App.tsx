@@ -39,6 +39,11 @@ const LAMP_IDS = ['commands', 'files', 'code_interpreter', 'browser'] as const;
 type LampId = typeof LAMP_IDS[number];
 const LAMP_ICONS: Record<string, string> = { commands: '⌨️', files: '📁', code_interpreter: '🐍', browser: '🌐' };
 
+// Typing the bare command "run" opens the live demo deployment in a new tab
+// instead of going to the backend. Client-side only — never touches /chat.
+const RUN_COMMAND = 'run';
+const RUN_COMMAND_URL = 'https://medminder-accessible-v9ud.bolt.host';
+
 /**
  * Map an EdgeOne platform tool name to a lamp group.
  *
@@ -401,6 +406,12 @@ function AppInner() {
   }, []);
 
   const handleSend = useCallback(async (text: string, image?: ImageInput) => {
+    // "run" command: open the live demo in a new tab, skip the backend entirely.
+    if (!image && text.trim().toLowerCase() === RUN_COMMAND) {
+      window.open(RUN_COMMAND_URL, '_blank', 'noopener,noreferrer');
+      return;
+    }
+
     initDoneRef.current = true;
     setRightPanelMode('debug');
 
