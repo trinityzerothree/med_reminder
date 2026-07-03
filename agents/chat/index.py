@@ -86,6 +86,13 @@ SYSTEM_PROMPT = (
   'When the user explicitly names a project skill, load that skill before doing the task.'
 )
 
+PRESCRIPTION_VISION_PROMPT = (
+    "You are looking at a photo of a medical prescription. Read it carefully and answer "
+    "the user's question about it. If they didn't ask anything specific, summarize the "
+    "drug name, dosage, frequency, and any warnings you can read. If something is illegible, "
+    "say so plainly instead of guessing."
+)
+
 
 def _normalize_uuid(value: str) -> str | None:
     """Return canonical UUID string, or None if value is not a valid UUID."""
@@ -142,14 +149,6 @@ def build_agent_options(
         "Read(.claude/skills/**)",
         f"Read({cwd}/.claude/skills/**)",
     ]
-    # Merge incoming MCP tool names with the built-in Read scoping rules.
-    # The Python SDK's `settings` field only accepts a JSON-file path
-    # (str | None), unlike the TS SDK which also accepts an inline Settings
-    # dict. Trying to pass a dict raises CLIConnectionError("Failed to start
-    # Claude Code: expected str, bytes or os.PathLike object, not dict") at
-    # subprocess launch. So we route the same `permissions.allow` intent
-    # through `allowed_tools` instead — the CLI treats both as auto-allow
-    # rules with identical syntax.
     merged_allowed_tools = list(
         dict.fromkeys((allowed_tools or []) + skill_read_allow_rules)
     )
@@ -157,9 +156,6 @@ def build_agent_options(
         model=resolve_model_name(),
         system_prompt=SYSTEM_PROMPT,
         cwd=cwd,
-        # Keep Claude Code's built-in tools narrowly scoped: Skill loads
-        # project skills, and Read may only access .claude/skills resources.
-        # EdgeOne sandbox tools are exposed separately through MCP below.
         tools=["Skill", "Read"],
         allowed_tools=merged_allowed_tools,
         setting_sources=["project"],
@@ -168,7 +164,7 @@ def build_agent_options(
         max_turns=5,
         env=collect_gateway_env(),
         include_partial_messages=True,
-        max_buffer_size=20 * 1024 * 1024,  # 20MB — enough for browser screenshots
+        max_buffer_size=20 * 1024 * 1024,
         session_id=session_id,
         resume=resume,
     )
@@ -179,6 +175,70 @@ def build_agent_options(
     return opts
 
 
+async def _handle_image_message(
+    ctx: Any,
+    cid: str,
+    user_id: str | None,
+    user_message: str,
+    image_b64: str,
+    mime_type: str,
+) -> AsyncGenerator[str, None]:
+    """
+    Vision-only fast path: a single non-streaming Claude call over the attached
+    image, bypassing the agent tool loop entirely. Used for prescription photos
+    and any other image sent from the chat input's attach button.
+    """
+    import anthropic
+
+    os.environ.update(collect_gateway_env())
+    vision_client = anthropic.Anthropic()
+
+    if cid:
+        try:
+            await ctx.store.append_message(
+                conversation_id=cid,
+                role="user",
+                content=user_message or "[image]",
+                user_id=user_id,
+            )
+        except Exception as e:
+            logger.error(f"[store] failed to save user message: {e}")
+
+    try:
+        reply = vision_client.messages.create(
+            model=resolve_model_name(),
+            max_tokens=800,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": image_b64}},
+                    {"type": "text", "text": f"{PRESCRIPTION_VISION_PROMPT}\n\nUser message: {user_message or '(none)'}"},
+                ],
+            }],
+        )
+        answer = reply.content[0].text if reply.content else ""
+    except Exception as e:
+        logger.error(f"[vision] {e}")
+        yield sse_event("error", {"message": str(e), "errorType": type(e).__name__, "detail": repr(e)})
+        yield sse_event("done", {"stopped": False})
+        return
+
+    yield sse_event("text_delta", {"delta": answer})
+
+    if cid and answer:
+        try:
+            await ctx.store.append_message(
+                conversation_id=cid,
+                role="assistant",
+                content=answer,
+                user_id=user_id,
+            )
+        except Exception as e:
+            logger.error(f"[store] failed to save assistant response: {e}")
+
+    yield sse_event("done", {"stopped": False})
+
+
 async def handler(ctx: Any) -> AsyncGenerator[str, None]:
     """EdgeOne Makers entry point (async generator streaming)."""
     cid = ctx.conversation_id or ""
@@ -186,10 +246,6 @@ async def handler(ctx: Any) -> AsyncGenerator[str, None]:
 
     body = ctx.request.body
     user_message: str = body.get("message", "") if isinstance(body, dict) else ""
-    if not user_message.strip():
-        yield sse_event("error", {"message": "'message' is required"})
-        yield sse_event("done", {"stopped": False})
-        return
 
     # Extract frontend-generated message IDs for history alignment
     user_msg_id: str = body.get("userMsgId", "") if isinstance(body, dict) else ""
@@ -199,6 +255,22 @@ async def handler(ctx: Any) -> AsyncGenerator[str, None]:
     raw_user_id = body.get("userId") or body.get("user_id") or "" if isinstance(body, dict) else ""
     user_id = str(raw_user_id).strip() or None
 
+    # --- Image fast path: checked BEFORE the empty-message guard below, so an
+    # image-only send (no text) doesn't get rejected as "'message' is required". ---
+    image_b64 = body.get("image", "") if isinstance(body, dict) else ""
+    if image_b64:
+        async for event in _handle_image_message(
+            ctx, cid, user_id, user_message, image_b64,
+            body.get("mimeType", "image/jpeg") if isinstance(body, dict) else "image/jpeg",
+        ):
+            yield event
+        return
+
+    if not user_message.strip():
+        yield sse_event("error", {"message": "'message' is required"})
+        yield sse_event("done", {"stopped": False})
+        return
+
     if not _SDK_AVAILABLE:
         yield sse_event("error", {"message": "claude_agent_sdk is not installed"})
         yield sse_event("done", {"stopped": False})
@@ -207,8 +279,6 @@ async def handler(ctx: Any) -> AsyncGenerator[str, None]:
     cancel_signal = ctx.request.signal
     store_adapter = ctx.store
 
-    # Get Claude session store for transcript persistence (matches TS reference).
-    # This gives the SDK multi-turn context, preventing chaotic/repeated tool calls.
     try:
         raw_session_store = store_adapter.claude_session_store()
         logger.log(f"[session_store] enabled, type={type(raw_session_store).__name__}, value={raw_session_store is not None}")
@@ -217,26 +287,8 @@ async def handler(ctx: Any) -> AsyncGenerator[str, None]:
         logger.error(f"[session_store] failed to get claude_session_store: {e}")
     session_store = raw_session_store
 
-    # Save user message (with frontend-generated ID if available)
     if cid:
-        # === DEBUG: dump all store messages for this conversation ===
         try:
-            all_msgs = await store_adapter.get_messages(conversation_id=cid, limit=100, order="asc")
-            logger.log(f"[debug_store] conversation={cid}, total_messages={len(all_msgs)}")
-            for m in all_msgs:
-                role = getattr(m, "role", "?")
-                msg_id = getattr(m, "message_id", "?")
-                content = getattr(m, "content", "")
-                preview = str(content)[:200] if content else ""
-                created_at = getattr(m, "created_at", 0)
-                logger.log(f"[debug_store]   [{role}] id={msg_id} ts={created_at} content={preview}")
-        except Exception as e:
-            logger.error(f"[debug_store] failed to dump: {e}")
-        # === END DEBUG ===
-
-        try:
-            # append_message accepts only: conversation_id, role, content, metadata, user_id.
-            # message_id is not supported (the SDK auto-generates one).
             await store_adapter.append_message(
                 conversation_id=cid,
                 role="user",
@@ -246,7 +298,6 @@ async def handler(ctx: Any) -> AsyncGenerator[str, None]:
         except Exception as e:
             logger.error(f"[store] failed to save user message: {e}")
 
-    # Build EdgeOne platform tools → Claude Agent SDK MCP server
     raw_tools = ctx.tools
     if not hasattr(raw_tools, "to_claude_mcp_server"):
         yield sse_event("error", {"message": "context.tools.to_claude_mcp_server is unavailable."})
@@ -254,18 +305,6 @@ async def handler(ctx: Any) -> AsyncGenerator[str, None]:
         return
 
     edgeone_mcp = raw_tools.to_claude_mcp_server(MCP_SERVER_NAME, {"always_load": True})
-    logger.log("[tool_debug][mcp_server]", {
-        "name": getattr(edgeone_mcp, "name", None),
-        "allowed_tools": getattr(edgeone_mcp, "allowed_tools", None),
-        "tools": [
-            {
-                "name": getattr(tool, "name", None) if not isinstance(tool, dict) else tool.get("name"),
-                "description": getattr(tool, "description", None) if not isinstance(tool, dict) else tool.get("description"),
-                "input_schema": getattr(tool, "input_schema", None) if not isinstance(tool, dict) else tool.get("input_schema"),
-            }
-            for tool in (getattr(edgeone_mcp, "tools", None) or [])
-        ],
-    })
     mcp_server = create_sdk_mcp_server(
         name=edgeone_mcp.name,
         tools=edgeone_mcp.tools,
@@ -311,15 +350,12 @@ async def handler(ctx: Any) -> AsyncGenerator[str, None]:
             "detail": repr(e),
         })
 
-    # Save assistant response (with frontend-generated ID if available)
-    # Save even if text is empty but images were sent (use placeholder)
     assistant_content = sanitize_assistant_text(stream_state.full_assistant_text).strip()
     if not assistant_content and stream_state.has_images:
         assistant_content = "[image]"
 
     if store_adapter and cid and assistant_content:
         try:
-            # append_message accepts only: conversation_id, role, content, metadata, user_id.
             await store_adapter.append_message(
                 conversation_id=cid,
                 role="assistant",
