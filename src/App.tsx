@@ -13,7 +13,7 @@ import {
   sendMessageStream,
   stopAgent,
 } from './api';
-import type { RawSseEvent } from './api';
+import type { RawSseEvent, ImageInput } from './api';
 import { I18nProvider, LangToggle, useT, MessageKeys } from './i18n';
 import {
   base64ToBlob,
@@ -400,7 +400,7 @@ function AppInner() {
     abortCtrlRef.current = null;
   }, []);
 
-  const handleSend = useCallback(async (text: string) => {
+  const handleSend = useCallback(async (text: string, image?: ImageInput) => {
     initDoneRef.current = true;
     setRightPanelMode('debug');
 
@@ -600,7 +600,7 @@ function AppInner() {
         updateBotMessage(content => content || t("status.error"));
         finishStream();
       },
-    }, conversationIdRef.current, { userMsgId: userMsg.id, botMsgId }, eoUuidRef.current);
+    }, conversationIdRef.current, { userMsgId: userMsg.id, botMsgId }, eoUuidRef.current, image);
 
     abortCtrlRef.current = ctrl;
   }, [updateBotMessage, setBotActivity, finishBotActivity, clearBotStreaming, handleImageEvent, finishStream, refreshConversations, t]);
